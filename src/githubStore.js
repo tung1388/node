@@ -34,8 +34,10 @@ const JSDELIVR_RETRY_DELAYS_MS = [500, 1000, 2000]; // brand-new commits can tak
 const CHUNK_UPLOAD_CONCURRENCY = 4;
 
 // Runs `worker` over `items` with at most `limit` in flight at once -
-// no dependency needed for a pool this small.
-async function runWithConcurrency(items, limit, worker) {
+// no dependency needed for a pool this small. Exported so callers (e.g.
+// src/cli.js's upload-folder) can parallelize across whole files, not
+// just chunks within one file.
+export async function runWithConcurrency(items, limit, worker) {
   const results = new Array(items.length);
   let next = 0;
   async function runNext() {
@@ -97,39 +99,65 @@ async function getHeadCommitSha(config) {
   return sha;
 }
 
-/** Shared PUT-encrypted-content-at-a-path core, used by uploadFile (random path, always new) and storePat (fixed path, may already exist). */
+const COMMIT_CONFLICT_RETRY_DELAYS_MS = [300, 600, 1200, 2000, 3000];
+
+/**
+ * Shared PUT-encrypted-content-at-a-path core, used by uploadFile (random
+ * path, always new) and storePat/saveManifest (fixed path, may already
+ * exist).
+ *
+ * The Contents API commits are inherently serialized per-repo: each PUT
+ * creates a new commit with the branch's current HEAD as its sole parent,
+ * then fast-forwards the branch ref. Two PUTs in flight at once - even to
+ * completely unrelated paths - can both read the same HEAD and race to
+ * move the ref; the loser gets a 409, regardless of whether `sha` was
+ * involved in the actual conflict. Since a fresh commit at the new HEAD
+ * is exactly what a retry produces, just resending the same request a
+ * few times (no need to touch `sha` - that part of the request was
+ * correct) is enough to win eventually.
+ *
+ * This does NOT cover the different case of the same path being updated
+ * by two independent operations, where `sha` itself genuinely goes stale
+ * and the caller needs to re-read the content before retrying - see
+ * src/cli.js's upload-folder manifest-flush retry for that.
+ */
 async function putEncrypted({ encrypted, path, message, config, sha }) {
   const { token, owner, repo } = config;
-  const res = await fetch(
-    `${GITHUB_API}/repos/${owner}/${repo}/contents/${path}`,
-    {
-      method: "PUT",
-      headers: { ...githubHeaders(token), "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message,
-        content: encrypted.toString("base64"),
-        ...(sha ? { sha } : {}),
-      }),
+  let lastError;
+  for (let attempt = 0; attempt <= COMMIT_CONFLICT_RETRY_DELAYS_MS.length; attempt += 1) {
+    const res = await fetch(
+      `${GITHUB_API}/repos/${owner}/${repo}/contents/${path}`,
+      {
+        method: "PUT",
+        headers: { ...githubHeaders(token), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message,
+          content: encrypted.toString("base64"),
+          ...(sha ? { sha } : {}),
+        }),
+      }
+    );
+
+    if (res.ok) {
+      const data = await res.json();
+      const commitSha = data.commit?.sha;
+      if (!commitSha) {
+        throw new Error("github upload failed: no commit sha in response");
+      }
+      return {
+        path,
+        commit_sha: commitSha,
+        content_sha: data.content?.sha, // needed as the `sha` on a later overwriting PUT (optimistic concurrency) - distinct from commit_sha
+        cdn_url: `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${commitSha}/${path}`,
+      };
     }
-  );
 
-  if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`github upload failed: ${res.status} ${body.slice(0, 300)}`);
+    lastError = new Error(`github upload failed: ${res.status} ${body.slice(0, 300)}`);
+    if (res.status !== 409 || attempt === COMMIT_CONFLICT_RETRY_DELAYS_MS.length) throw lastError;
+    await sleep(COMMIT_CONFLICT_RETRY_DELAYS_MS[attempt]);
   }
-
-  const data = await res.json();
-  const commitSha = data.commit?.sha;
-  if (!commitSha) {
-    throw new Error("github upload failed: no commit sha in response");
-  }
-
-  return {
-    path,
-    commit_sha: commitSha,
-    content_sha: data.content?.sha, // needed as the `sha` on a later overwriting PUT (optimistic concurrency) - distinct from commit_sha
-    cdn_url: `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${commitSha}/${path}`,
-  };
+  throw lastError;
 }
 
 /**

@@ -25,7 +25,10 @@
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
-import { uploadFile, downloadFile, storePat, loadManifest, saveManifest } from "./githubStore.js";
+import { uploadFile, downloadFile, storePat, loadManifest, saveManifest, runWithConcurrency } from "./githubStore.js";
+import { CHUNK_SIZE } from "./crypto.js";
+
+const FILE_UPLOAD_CONCURRENCY = 5;
 
 const MIME_BY_EXT = {
   ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif",
@@ -155,43 +158,78 @@ async function main() {
     });
     const sizes = await Promise.all(files.map(async (f) => (await fs.stat(f)).size));
     const totalBytes = sizes.reduce((a, b) => a + b, 0);
-    console.log(`Found ${files.length} files under ${localDir} (${formatBytes(totalBytes)} total)`);
+    console.log(`Found ${files.length} files under ${localDir} (${formatBytes(totalBytes)} total), uploading ${FILE_UPLOAD_CONCURRENCY} at a time`);
 
     let { entries, sha } = await loadManifest({ folder, config });
     const existingNames = new Set(entries.map((e) => e.name));
     let uploadedBytes = sizes.reduce((sum, size, i) => sum + (existingNames.has(names[i]) ? size : 0), 0);
 
-    for (const [i, filePath] of files.entries()) {
-      const name = names[i];
-      const size = sizes[i];
-      if (existingNames.has(name)) {
-        console.log(`[${i + 1}/${files.length}] skip (already uploaded): ${name}`);
-        continue;
-      }
-
-      const buffer = await fs.readFile(filePath);
-      const type = guessType(filePath);
-      const overallPct = totalBytes ? ((uploadedBytes / totalBytes) * 100).toFixed(1) : "100.0";
-      console.log(`[${i + 1}/${files.length}] uploading ${name} (${formatBytes(size)}) - overall ${formatBytes(uploadedBytes)}/${formatBytes(totalBytes)} (${overallPct}%)`);
-      const result = await uploadFile({
-        buffer, fileName: name, folder, config,
-        onChunkProgress: (done, total) => process.stdout.write(`\r  chunk ${done}/${total}${done === total ? "\n" : ""}`),
+    // File uploads (encrypt + PUT chunks) run concurrently, but manifest
+    // writes have to be batched and serialized: they all share one `sha`
+    // for GitHub's optimistic-concurrency check, and GitHub's Contents API
+    // can still 409 on the very next write to a path that was just written
+    // a moment ago (its read path can lag its own write path) even when
+    // our own requests are strictly sequential. Writing after every single
+    // file under concurrency hits that constantly, so instead: finished
+    // uploads accumulate in `pending` and get flushed as one manifest
+    // write every MANIFEST_BATCH_SIZE files (plus a final flush at the
+    // end) - far fewer manifest writes, each with more breathing room.
+    const MANIFEST_BATCH_SIZE = 20;
+    let pending = [];
+    let manifestQueue = Promise.resolve();
+    function flush() {
+      if (pending.length === 0) return manifestQueue;
+      const batch = pending;
+      pending = [];
+      manifestQueue = manifestQueue.then(async () => {
+        entries = [...entries, ...batch];
+        for (let attempt = 0; ; attempt += 1) {
+          try {
+            ({ sha } = await saveManifest({ folder, entries, sha, config }));
+            return;
+          } catch (err) {
+            if (attempt >= 5 || !/^github upload failed: 409/.test(err.message)) throw err;
+            await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+            const fresh = await loadManifest({ folder, config });
+            entries = [...fresh.entries, ...batch];
+            sha = fresh.sha;
+          }
+        }
       });
-      if (!result.chunked) console.log("  done");
-      uploadedBytes += size;
-
-      const entry = {
-        id: result.id, name, type, size: buffer.length, uploadedAt: new Date().toISOString(),
-        ...(result.chunked ? { chunked: true, chunkCount: result.chunkCount } : {}),
-      };
-      entries = [...entries, entry];
-      existingNames.add(name);
-
-      // Save after every file (not just at the end) so a crash/interrupt on
-      // a 10GB upload only loses the file in flight, not everything before it.
-      ({ sha } = await saveManifest({ folder, entries, sha, config }));
+      return manifestQueue;
     }
 
+    const targets = files
+      .map((filePath, i) => ({ filePath, name: names[i], size: sizes[i], index: i }))
+      .filter(({ name }) => {
+        if (!existingNames.has(name)) return true;
+        console.log(`[skip] already uploaded: ${name}`);
+        return false;
+      });
+
+    await runWithConcurrency(targets, FILE_UPLOAD_CONCURRENCY, async ({ filePath, name, size, index }) => {
+      const buffer = await fs.readFile(filePath);
+      const type = guessType(filePath);
+      const chunkNote = buffer.length > CHUNK_SIZE ? `, ${Math.ceil(buffer.length / CHUNK_SIZE)} chunks` : "";
+      console.log(`[${index + 1}/${files.length}] uploading ${name} (${formatBytes(size)}${chunkNote})`);
+
+      const result = await uploadFile({
+        buffer, fileName: name, folder, config,
+        onChunkProgress: (done, total) => console.log(`  [${name}] chunk ${done}/${total}`),
+      });
+
+      uploadedBytes += size;
+      const overallPct = totalBytes ? ((uploadedBytes / totalBytes) * 100).toFixed(1) : "100.0";
+      console.log(`[${index + 1}/${files.length}] done: ${name} - overall ${formatBytes(uploadedBytes)}/${formatBytes(totalBytes)} (${overallPct}%)`);
+
+      pending.push({
+        id: result.id, name, type, size: buffer.length, uploadedAt: new Date().toISOString(),
+        ...(result.chunked ? { chunked: true, chunkCount: result.chunkCount } : {}),
+      });
+      if (pending.length >= MANIFEST_BATCH_SIZE) await flush();
+    });
+
+    await flush();
     console.log(`Done. Manifest has ${entries.length} entries.`);
     return;
   }
