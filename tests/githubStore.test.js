@@ -36,7 +36,6 @@ test("uploadFile PUTs base64-encrypted content under blobs/<folder>/ and returns
 
   const result = await uploadFile({
     buffer: Buffer.from("hello world"),
-    fileName: "hello.txt",
     folder: "quantran",
     config: ADMIN_CONFIG,
   });
@@ -47,7 +46,9 @@ test("uploadFile PUTs base64-encrypted content under blobs/<folder>/ and returns
 
   const body = JSON.parse(capturedInit.body);
   assert.match(body.content, /^[A-Za-z0-9+/]+=*$/); // valid base64
-  assert.match(body.message, /hello\.txt/);
+  // Commit messages sit unencrypted in a public repo - the real filename
+  // must never end up in one, only inside the encrypted manifest entry.
+  assert.doesNotMatch(body.message, /hello/i);
 
   assert.match(result.path, /^blobs\/quantran\/[0-9a-f-]{36}\.enc$/);
   assert.equal(result.commit_sha, "abc123");
@@ -59,14 +60,14 @@ test("uploadFile PUTs base64-encrypted content under blobs/<folder>/ and returns
 
 test("uploadFile throws if the caller's config has no key for that folder", async () => {
   await assert.rejects(
-    () => uploadFile({ buffer: Buffer.from("x"), fileName: "x.txt", folder: "admin", config: QUANTRAN_CONFIG }),
+    () => uploadFile({ buffer: Buffer.from("x"), folder: "admin", config: QUANTRAN_CONFIG }),
     /no encryption key configured for folder "admin"/
   );
 });
 
 test("uploadFile requires a folder", async () => {
   await assert.rejects(
-    () => uploadFile({ buffer: Buffer.from("x"), fileName: "x.txt", config: ADMIN_CONFIG }),
+    () => uploadFile({ buffer: Buffer.from("x"), config: ADMIN_CONFIG }),
     /folder is required/
   );
 });
@@ -127,7 +128,7 @@ test("uploadFile throws with the response body on a non-ok GitHub response", asy
   );
 
   await assert.rejects(
-    () => uploadFile({ buffer: Buffer.from("x"), fileName: "x.txt", folder: "admin", config: ADMIN_CONFIG }),
+    () => uploadFile({ buffer: Buffer.from("x"), folder: "admin", config: ADMIN_CONFIG }),
     /github upload failed: 401/
   );
 });
@@ -253,7 +254,6 @@ test("uploadFile calls onChunkProgress once per chunk, ending at (chunkCount, ch
   const calls = [];
   await uploadFile({
     buffer: original,
-    fileName: "big.bin",
     folder: "quantran",
     config: ADMIN_CONFIG,
     chunkSize: 30, // -> 4 chunks
@@ -272,7 +272,6 @@ test("uploadFile splits a buffer bigger than chunkSize into independently encryp
 
   const result = await uploadFile({
     buffer: original,
-    fileName: "big.bin",
     folder: "quantran",
     config: ADMIN_CONFIG,
     chunkSize: 30, // -> 4 chunks (30,30,30,10)
@@ -309,7 +308,6 @@ test("uploadFile resume: chunks that already exist are skipped (no PUT) and stil
 
   const result = await uploadFile({
     buffer: original,
-    fileName: "resume.bin",
     folder: "quantran",
     config: ADMIN_CONFIG,
     id: "fixed-id",

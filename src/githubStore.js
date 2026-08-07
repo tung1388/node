@@ -165,11 +165,13 @@ async function putEncrypted({ encrypted, path, message, config, sha }) {
  * GitHub repo via the Contents API (a plain HTTPS PUT - no local git
  * binary needed).
  *
- * The stored filename is a random UUID, deliberately unrelated to
- * `fileName` or the file's content - the repo has to be public for
+ * The stored filename is a random UUID, deliberately unrelated to the
+ * real filename or the file's content - the repo has to be public for
  * jsDelivr to read it at all, so nothing about what's stored (name,
  * type, whether two uploads share content) should be visible from the
- * repo listing beyond "this folder has N files."
+ * repo listing or commit history beyond "this folder has N files." The
+ * real filename never appears anywhere unencrypted - not in the path,
+ * not in the commit message - only inside the encrypted manifest entry.
  *
  * Files at or under CHUNK_SIZE upload as a single blob and return
  * { chunked: false, path, commit_sha, cdn_url } (unchanged shape from
@@ -189,7 +191,7 @@ async function putEncrypted({ encrypted, path, message, config, sha }) {
  * progress on a single big chunked file, since chunks upload with
  * limited concurrency and the whole call otherwise only resolves once.
  */
-export async function uploadFile({ buffer, fileName, folder, config, id = randomUUID(), chunkSize = CHUNK_SIZE, onChunkProgress }) {
+export async function uploadFile({ buffer, folder, config, id = randomUUID(), chunkSize = CHUNK_SIZE, onChunkProgress }) {
   if (!folder) throw new Error("folder is required");
   const key = keyForFolder(config, folder);
 
@@ -201,7 +203,7 @@ export async function uploadFile({ buffer, fileName, folder, config, id = random
       ...(await putEncrypted({
         encrypted,
         path: `blobs/${folder}/${id}.enc`,
-        message: `store: ${fileName || "blob"}`,
+        message: "store: blob", // never the real filename - commit messages sit unencrypted in a public repo
         config,
       })),
     };
@@ -223,7 +225,7 @@ export async function uploadFile({ buffer, fileName, folder, config, id = random
       };
     }
     const encrypted = encryptBuffer(chunk, key);
-    const result = await putEncrypted({ encrypted, path, message: `store: ${fileName || "blob"} (chunk ${index}/${chunks.length})`, config });
+    const result = await putEncrypted({ encrypted, path, message: `store: blob chunk ${index}/${chunks.length}`, config });
     onChunkProgress?.(++completed, chunks.length);
     return result;
   });

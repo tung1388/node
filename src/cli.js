@@ -120,7 +120,7 @@ async function main() {
     if (!folder || !filePath) throw new Error("usage: node src/cli.js upload <folder> <path>");
     const buffer = await fs.readFile(filePath);
     const result = await uploadFile({
-      buffer, fileName: path.basename(filePath), folder, config,
+      buffer, folder, config,
       onChunkProgress: (done, total) => process.stdout.write(`\r  chunk ${done}/${total}${done === total ? "\n" : ""}`),
     });
     console.log(`Uploaded ${filePath} (${buffer.length} bytes plaintext)`);
@@ -214,7 +214,7 @@ async function main() {
       console.log(`[${index + 1}/${files.length}] uploading ${name} (${formatBytes(size)}${chunkNote})`);
 
       const result = await uploadFile({
-        buffer, fileName: name, folder, config,
+        buffer, folder, config,
         onChunkProgress: (done, total) => console.log(`  [${name}] chunk ${done}/${total}`),
       });
 

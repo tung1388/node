@@ -351,7 +351,7 @@ async function handleUpload(file) {
       ...currentSession,
       path: blobPath(currentSession, id),
       bytes: encrypted,
-      message: `store: ${file.name}`,
+      message: "store: blob", // never the real filename - commit messages sit unencrypted in a public repo
     });
     entry = { id, name: file.name, type, size: file.size, uploadedAt: new Date().toISOString() };
   } else {
@@ -366,7 +366,7 @@ async function handleUpload(file) {
         ...currentSession,
         path: chunkPath(currentSession, id, index),
         bytes: encrypted,
-        message: `store: ${file.name} (chunk ${index}/${chunks.length})`,
+        message: `store: blob chunk ${index}/${chunks.length}`,
       });
       uploaded += 1;
       els.uploadStatus.textContent = `Uploading ${file.name}… (${uploaded}/${chunks.length} chunks)`;
@@ -477,7 +477,7 @@ async function previewEntry(entry) {
         const path = blobPath(currentSession, entry.id);
         const current = await getFile({ ...currentSession, path });
         const encrypted = await encryptBuffer(newDbBytes, currentSession.key);
-        await putFile({ ...currentSession, path, bytes: encrypted, message: `edit: ${entry.name}`, sha: current?.sha });
+        await putFile({ ...currentSession, path, bytes: encrypted, message: "edit: blob", sha: current?.sha });
 
         entry.size = newDbBytes.length;
         entry.uploadedAt = new Date().toISOString();
