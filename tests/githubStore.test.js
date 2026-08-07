@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { uploadFile, downloadFile, storePat, loadManifest, saveManifest } from "../src/githubStore.js";
+import { uploadFile, downloadFile, storePat, loadManifest, saveManifest, createBlobsForFile, commitFilesToManifest } from "../src/githubStore.js";
 import { encryptBuffer, decryptBuffer } from "../src/crypto.js";
 
 const ADMIN_CONFIG = {
@@ -209,46 +209,89 @@ test("downloadFile gives up and throws after exhausting retries", async (t) => {
 
 // ---- chunked upload/download -------------------------------------------
 
-// In-memory fake of the GitHub Contents API, keyed by path, so chunked
-// tests can exercise real multi-request flows (GET-then-PUT per chunk,
-// resume skipping) without a 64MB buffer or a real network call.
-function fakeGithub({ existingPaths = new Set(), headCommitSha = "head-sha" } = {}) {
-  const store = new Map(); // path -> { content (base64), commitSha }
+// In-memory fake of the GitHub Git Data API (blobs/trees/commits/refs) -
+// what chunked/batch uploads now use instead of one Contents-API PUT per
+// blob, so tests can exercise the real multi-request flow (parallel blob
+// creation, then one tree+commit+ref-update) without a real network call.
+function fakeGitData({ owner = "fake-owner", repo = "fake-repo", branch = "main" } = {}) {
+  const blobs = new Map(); // sha -> base64 content
+  const trees = new Map(); // sha -> Map(path -> blobSha), fully materialized (base_tree already merged in)
+  const commits = new Map(); // sha -> { treeSha, parents }
+  let blobCounter = 0;
+  let treeCounter = 0;
   let commitCounter = 0;
+
+  const initialTreeSha = "tree-0";
+  trees.set(initialTreeSha, new Map());
+  let headCommitSha = "commit-0";
+  commits.set(headCommitSha, { treeSha: initialTreeSha, parents: [] });
+
   const calls = [];
+  const prefix = `https://api.github.com/repos/${owner}/${repo}`;
 
   async function fetchImpl(url, init) {
-    calls.push({ url, init });
-    const path = decodeURIComponent(String(url).replace("https://api.github.com/repos/fake-owner/fake-repo/contents/", ""));
+    calls.push({ url: String(url), init });
+    const u = String(url);
+    const method = init?.method;
 
-    if (!init || init.method === undefined) {
-      // repo/default-branch lookups used by getHeadCommitSha
-      if (String(url) === "https://api.github.com/repos/fake-owner/fake-repo") {
-        return jsonResponse({ default_branch: "main" });
-      }
-      if (String(url) === "https://api.github.com/repos/fake-owner/fake-repo/commits/main") {
-        return jsonResponse({ sha: headCommitSha });
-      }
-      // getExistingSha
-      if (existingPaths.has(path) || store.has(path)) {
-        return jsonResponse({ sha: `blobsha-${path}` });
-      }
-      return { ok: false, status: 404 };
+    if (u === prefix && !method) return jsonResponse({ default_branch: branch });
+    if (u === `${prefix}/git/ref/heads/${branch}` && !method) return jsonResponse({ object: { sha: headCommitSha } });
+
+    const commitMatch = u.match(/\/git\/commits\/([^/]+)$/);
+    if (commitMatch && !method) {
+      const c = commits.get(commitMatch[1]);
+      if (!c) return { ok: false, status: 404, text: async () => "no such commit" };
+      return jsonResponse({ tree: { sha: c.treeSha } });
     }
-
-    // PUT
-    commitCounter += 1;
-    const body = JSON.parse(init.body);
-    store.set(path, { content: body.content, commitSha: `commit-${commitCounter}` });
-    return jsonResponse({ commit: { sha: `commit-${commitCounter}` } });
+    if (u === `${prefix}/git/blobs` && method === "POST") {
+      blobCounter += 1;
+      const sha = `blob-${blobCounter}`;
+      blobs.set(sha, JSON.parse(init.body).content);
+      return jsonResponse({ sha });
+    }
+    if (u === `${prefix}/git/trees` && method === "POST") {
+      const body = JSON.parse(init.body);
+      const merged = new Map(trees.get(body.base_tree));
+      for (const item of body.tree) merged.set(item.path, item.sha);
+      treeCounter += 1;
+      const sha = `tree-${treeCounter}`;
+      trees.set(sha, merged);
+      return jsonResponse({ sha });
+    }
+    if (u === `${prefix}/git/commits` && method === "POST") {
+      const body = JSON.parse(init.body);
+      commitCounter += 1;
+      const sha = `commit-${commitCounter}`;
+      commits.set(sha, { treeSha: body.tree, parents: body.parents });
+      return jsonResponse({ sha });
+    }
+    if (u === `${prefix}/git/refs/heads/${branch}` && method === "PATCH") {
+      headCommitSha = JSON.parse(init.body).sha;
+      return jsonResponse({ object: { sha: headCommitSha } });
+    }
+    // Contents-API GET - loadManifest() still reads manifest.enc this way even
+    // though writes now go through the Git Data API above; served by looking
+    // the path up in the current HEAD tree.
+    const contentsMatch = u.match(new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/contents/(.+)$`));
+    if (contentsMatch && !method) {
+      const p = decodeURIComponent(contentsMatch[1]);
+      const blobSha = currentTree().get(p);
+      if (!blobSha) return { ok: false, status: 404 };
+      return jsonResponse({ content: blobs.get(blobSha), sha: blobSha });
+    }
+    throw new Error(`fakeGitData: unhandled request ${method || "GET"} ${u}`);
   }
 
-  return { fetchImpl, store, calls };
+  function currentTree() {
+    return trees.get(commits.get(headCommitSha).treeSha);
+  }
+
+  return { fetchImpl, blobs, calls, currentTree, commitCount: () => commitCounter };
 }
 
-test("uploadFile calls onChunkProgress once per chunk, ending at (chunkCount, chunkCount)", async (t) => {
+test("uploadFile calls onChunkProgress once per chunk (blob created), ending at (chunkCount, chunkCount)", async (t) => {
   const original = Buffer.from("0123456789".repeat(10)); // 100 bytes
-  const { fetchImpl } = fakeGithub();
+  const { fetchImpl } = fakeGitData();
   t.mock.method(globalThis, "fetch", fetchImpl);
 
   const calls = [];
@@ -265,10 +308,10 @@ test("uploadFile calls onChunkProgress once per chunk, ending at (chunkCount, ch
   assert.deepEqual(new Set(calls.map(([done]) => done)), new Set([1, 2, 3, 4]));
 });
 
-test("uploadFile splits a buffer bigger than chunkSize into independently encrypted chunks, and downloadFile reassembles them", async (t) => {
+test("uploadFile splits a buffer bigger than chunkSize into independently encrypted chunks committed together in ONE commit, and downloadFile reassembles them", async (t) => {
   const original = Buffer.from("0123456789".repeat(10)); // 100 bytes
-  const { fetchImpl, store } = fakeGithub();
-  t.mock.method(globalThis, "fetch", fetchImpl);
+  const fake = fakeGitData();
+  t.mock.method(globalThis, "fetch", fake.fetchImpl);
 
   const result = await uploadFile({
     buffer: original,
@@ -279,17 +322,22 @@ test("uploadFile splits a buffer bigger than chunkSize into independently encryp
 
   assert.equal(result.chunked, true);
   assert.equal(result.chunkCount, 4);
-  assert.equal(store.size, 4);
+  assert.equal(fake.blobs.size, 4); // 4 chunk blobs created
+  assert.equal(fake.commitCount(), 1); // but only ONE commit for all of them - the whole point of batching
+  assert.equal(new Set(result.chunks.map((c) => c.commit_sha)).size, 1); // all chunks share that one commit
+
+  const tree = fake.currentTree();
+  for (const chunk of result.chunks) assert.ok(tree.has(chunk.path), `tree missing ${chunk.path}`);
 
   // Each chunk is independently encrypted (different IV -> different ciphertext even for equal-length chunks).
-  const ciphertexts = result.chunks.map((c) => store.get(c.path).content);
+  const ciphertexts = result.chunks.map((c) => fake.blobs.get(tree.get(c.path)));
   assert.equal(new Set(ciphertexts).size, ciphertexts.length);
 
   t.mock.method(globalThis, "fetch", async (url) => {
     const path = String(url).replace(/^.*@[^/]+\//, "");
-    const entry = [...store.entries()].find(([p]) => p === path);
-    assert.ok(entry, `no stored chunk for ${path}`);
-    const bytes = Buffer.from(entry[1].content, "base64");
+    const blobSha = tree.get(path);
+    assert.ok(blobSha, `no stored chunk for ${path}`);
+    const bytes = Buffer.from(fake.blobs.get(blobSha), "base64");
     return { ok: true, status: 200, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) };
   });
 
@@ -300,33 +348,89 @@ test("uploadFile splits a buffer bigger than chunkSize into independently encryp
   assert.deepEqual(roundTripped, original);
 });
 
-test("uploadFile resume: chunks that already exist are skipped (no PUT) and still produce a valid cdn_url", async (t) => {
-  const original = Buffer.from("A".repeat(50));
-  // Chunk 0 (bytes 0-19) already uploaded; chunks 1 (20-39) and 2 (40-49) are not.
-  const { fetchImpl, calls } = fakeGithub({ existingPaths: new Set(["blobs/quantran/fixed-id/0.enc"]) });
-  t.mock.method(globalThis, "fetch", fetchImpl);
-
-  const result = await uploadFile({
-    buffer: original,
-    folder: "quantran",
-    config: ADMIN_CONFIG,
-    id: "fixed-id",
-    chunkSize: 20,
-  });
-
-  assert.equal(result.chunkCount, 3);
-  const putPaths = calls.filter((c) => c.init?.method === "PUT").map((c) =>
-    decodeURIComponent(String(c.url).replace("https://api.github.com/repos/fake-owner/fake-repo/contents/", ""))
-  );
-  assert.deepEqual(putPaths.sort(), ["blobs/quantran/fixed-id/1.enc", "blobs/quantran/fixed-id/2.enc"]);
-
-  const chunk0 = result.chunks.find((c) => c.path === "blobs/quantran/fixed-id/0.enc");
-  assert.equal(chunk0.commit_sha, "head-sha");
-  assert.equal(chunk0.cdn_url, "https://cdn.jsdelivr.net/gh/fake-owner/fake-repo@head-sha/blobs/quantran/fixed-id/0.enc");
-});
-
 test("downloadFile(cdnUrls) throws on an empty array", async () => {
   await assert.rejects(() => downloadFile({ cdnUrls: [], config: ADMIN_CONFIG }), /cdnUrls is empty/);
+});
+
+// ---- batch upload (createBlobsForFile + commitFilesToManifest) ---------
+// The path src/cli.js's upload-folder actually uses: blobs for many files
+// are created independently, then committed - and the manifest updated -
+// together in ONE commit, instead of one commit per file.
+
+test("createBlobsForFile creates one blob for a small file, or one per chunk for a big one - either way, commits nothing", async (t) => {
+  const fake = fakeGitData();
+  t.mock.method(globalThis, "fetch", fake.fetchImpl);
+
+  const small = await createBlobsForFile({ buffer: Buffer.from("small file"), folder: "quantran", config: ADMIN_CONFIG });
+  assert.equal(small.chunked, false);
+  assert.equal(small.blobEntries.length, 1);
+
+  const big = await createBlobsForFile({ buffer: Buffer.from("x".repeat(100)), folder: "quantran", config: ADMIN_CONFIG, chunkSize: 30 });
+  assert.equal(big.chunked, true);
+  assert.equal(big.blobEntries.length, 4);
+
+  assert.equal(fake.commitCount(), 0); // blob creation alone never commits
+  assert.equal(fake.blobs.size, 5); // 1 (small) + 4 (big's chunks)
+});
+
+test("commitFilesToManifest commits several files' blobs AND the manifest update together in ONE commit", async (t) => {
+  const fake = fakeGitData();
+  t.mock.method(globalThis, "fetch", fake.fetchImpl);
+
+  const fileA = await createBlobsForFile({ buffer: Buffer.from("file a"), folder: "quantran", config: ADMIN_CONFIG });
+  const fileB = await createBlobsForFile({ buffer: Buffer.from("file b"), folder: "quantran", config: ADMIN_CONFIG });
+  assert.equal(fake.commitCount(), 0); // still nothing committed yet
+
+  const now = new Date().toISOString();
+  const { commit_sha } = await commitFilesToManifest({
+    folder: "quantran",
+    blobEntries: [...fileA.blobEntries, ...fileB.blobEntries],
+    newManifestEntries: [
+      { id: fileA.id, name: "a.txt", type: "text/plain", size: 6, uploadedAt: now },
+      { id: fileB.id, name: "b.txt", type: "text/plain", size: 6, uploadedAt: now },
+    ],
+    message: "store: 2 file(s)",
+    config: ADMIN_CONFIG,
+  });
+
+  assert.equal(fake.commitCount(), 1); // 2 files + manifest, all in one commit
+  assert.ok(commit_sha);
+
+  const tree = fake.currentTree();
+  assert.ok(tree.has(fileA.blobEntries[0].path));
+  assert.ok(tree.has(fileB.blobEntries[0].path));
+  assert.ok(tree.has("blobs/quantran/manifest.enc"));
+
+  const { entries } = await loadManifest({ folder: "quantran", config: ADMIN_CONFIG });
+  assert.equal(entries.length, 2);
+  assert.deepEqual(entries.map((e) => e.name).sort(), ["a.txt", "b.txt"]);
+});
+
+test("commitFilesToManifest called twice appends to the existing manifest rather than overwriting it", async (t) => {
+  const fake = fakeGitData();
+  t.mock.method(globalThis, "fetch", fake.fetchImpl);
+
+  const fileA = await createBlobsForFile({ buffer: Buffer.from("file a"), folder: "quantran", config: ADMIN_CONFIG });
+  await commitFilesToManifest({
+    folder: "quantran",
+    blobEntries: fileA.blobEntries,
+    newManifestEntries: [{ id: fileA.id, name: "a.txt", type: "text/plain", size: 6, uploadedAt: new Date().toISOString() }],
+    message: "store: 1 file(s)",
+    config: ADMIN_CONFIG,
+  });
+
+  const fileB = await createBlobsForFile({ buffer: Buffer.from("file b"), folder: "quantran", config: ADMIN_CONFIG });
+  await commitFilesToManifest({
+    folder: "quantran",
+    blobEntries: fileB.blobEntries,
+    newManifestEntries: [{ id: fileB.id, name: "b.txt", type: "text/plain", size: 6, uploadedAt: new Date().toISOString() }],
+    message: "store: 1 file(s)",
+    config: ADMIN_CONFIG,
+  });
+
+  assert.equal(fake.commitCount(), 2);
+  const { entries } = await loadManifest({ folder: "quantran", config: ADMIN_CONFIG });
+  assert.deepEqual(entries.map((e) => e.name).sort(), ["a.txt", "b.txt"]);
 });
 
 // ---- manifest read/write (shared format with docs/app.js) --------------

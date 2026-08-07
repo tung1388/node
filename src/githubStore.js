@@ -85,21 +85,21 @@ async function getExistingSha({ path, config }) {
   return data.sha;
 }
 
-/** The default branch's current HEAD commit sha - used to build a valid cdn_url for a chunk that resume found already sitting in the repo (its own commit sha isn't known to us, but HEAD's tree contains it by definition since it already exists). */
-async function getHeadCommitSha(config) {
-  const { token, owner, repo } = config;
-  const repoRes = await fetch(`${GITHUB_API}/repos/${owner}/${repo}`, { headers: githubHeaders(token) });
-  if (!repoRes.ok) throw new Error(`github repo lookup failed: ${repoRes.status}`);
-  const { default_branch } = await repoRes.json();
-  const branchRes = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/commits/${default_branch}`, {
-    headers: githubHeaders(token),
-  });
-  if (!branchRes.ok) throw new Error(`github head commit lookup failed: ${branchRes.status}`);
-  const { sha } = await branchRes.json();
-  return sha;
-}
-
 const COMMIT_CONFLICT_RETRY_DELAYS_MS = [300, 600, 1200, 2000, 3000];
+
+// Batch commits (commitBatchNow) get a much longer retry budget than a
+// single Contents-API write: they're infrequent (once per COMMIT_BATCH_SIZE
+// files, not once per file), so a long ceiling costs nothing on the happy
+// path, but they're exactly the case most exposed to a genuinely busy
+// shared repo - another CLI run, a browser session uploading at the same
+// time, or (as observed in practice) this same folder being written from
+// two places at once. ~2 minutes cumulative gives real contention time to
+// clear instead of surfacing a failure a determined manual retry would've
+// resolved anyway. Jitter avoids two colliding writers retrying in lockstep.
+const BATCH_COMMIT_RETRY_DELAYS_MS = [300, 600, 1200, 2000, 3000, 4000, 6000, 8000, 10000, 15000, 20000, 30000];
+function withJitter(ms) {
+  return ms + Math.floor(Math.random() * ms * 0.3);
+}
 
 // The Contents API's commits are inherently serialized per-repo: each PUT
 // creates a new commit with the branch's current HEAD as its sole parent,
@@ -172,10 +172,137 @@ async function putEncryptedNow({ encrypted, path, message, config, sha }) {
   throw lastError;
 }
 
+// ---------------------------------------------------------------------
+// Git Data API primitives - used for chunked/batch uploads instead of
+// one Contents-API PUT (=one commit) per blob. Blob creation touches no
+// ref and has zero commit contention, so it can run at full caller
+// concurrency; only the final tree+commit+ref-update step needs the
+// one-at-a-time queue, and there's exactly one of those per BATCH of
+// blobs rather than one per blob. This is what makes upload-folder fast
+// at real concurrency instead of bottlenecked on serialized commits.
+// ---------------------------------------------------------------------
+
+/** Creates a git blob (raw content, not yet reachable from any commit) - no ref/commit involved, so many can run concurrently with zero contention. */
+async function createBlob({ encrypted, config }) {
+  const { token, owner, repo } = config;
+  const res = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/git/blobs`, {
+    method: "POST",
+    headers: { ...githubHeaders(token), "Content-Type": "application/json" },
+    body: JSON.stringify({ content: encrypted.toString("base64"), encoding: "base64" }),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`github blob create failed: ${res.status} ${body.slice(0, 300)}`);
+  }
+  const data = await res.json();
+  return data.sha;
+}
+
+const branchCache = new Map(); // "owner/repo" -> default_branch, doesn't change mid-run
+async function getDefaultBranch(config) {
+  const { token, owner, repo } = config;
+  const key = `${owner}/${repo}`;
+  if (branchCache.has(key)) return branchCache.get(key);
+  const res = await fetch(`${GITHUB_API}/repos/${owner}/${repo}`, { headers: githubHeaders(token) });
+  if (!res.ok) throw new Error(`github repo lookup failed: ${res.status}`);
+  const { default_branch } = await res.json();
+  branchCache.set(key, default_branch);
+  return default_branch;
+}
+
+/**
+ * Commits many already-created blobs in ONE commit: read current HEAD ->
+ * build a new tree on top of it (base_tree + new entries) -> create a
+ * commit -> fast-forward the branch ref. Queued (enqueueWrite) since the
+ * ref-update step is still a single per-repo point of contention, but
+ * that's now the ONLY serialized step per batch, not per file/chunk.
+ *
+ * `buildEntries()` is called fresh on every retry attempt (not just
+ * once) so a caller whose entries depend on other freshly-read state
+ * (src/cli.js's upload-folder re-reads the manifest here) stays correct
+ * even if an external writer's commit landed in between - re-invoking
+ * naturally re-reads that state instead of committing stale data on top
+ * of a new parent.
+ *
+ * Returns `{ commit_sha }`; combine with each entry's own `path` (which
+ * the caller already knows - it chose them) to build cdn_urls.
+ */
+async function commitBatch({ buildEntries, message, config }) {
+  return enqueueWrite(() => commitBatchNow({ buildEntries, message, config }));
+}
+
+async function commitBatchNow({ buildEntries, message, config }) {
+  const { token, owner, repo } = config;
+  const branch = await getDefaultBranch(config);
+  let lastError;
+  for (let attempt = 0; attempt <= BATCH_COMMIT_RETRY_DELAYS_MS.length; attempt += 1) {
+    try {
+      const refRes = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/git/ref/heads/${branch}`, { headers: githubHeaders(token) });
+      if (!refRes.ok) throw Object.assign(new Error(`github ref lookup failed: ${refRes.status}`), { status: refRes.status });
+      const refData = await refRes.json();
+      const parentSha = refData.object.sha;
+
+      const parentCommitRes = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/git/commits/${parentSha}`, { headers: githubHeaders(token) });
+      if (!parentCommitRes.ok) throw Object.assign(new Error(`github commit lookup failed: ${parentCommitRes.status}`), { status: parentCommitRes.status });
+      const { tree: { sha: baseTreeSha } } = await parentCommitRes.json();
+
+      const entries = await buildEntries();
+
+      const treeRes = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/git/trees`, {
+        method: "POST",
+        headers: { ...githubHeaders(token), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          base_tree: baseTreeSha,
+          tree: entries.map((e) => ({ path: e.path, mode: "100644", type: "blob", sha: e.blobSha })),
+        }),
+      });
+      if (!treeRes.ok) {
+        const body = await treeRes.text().catch(() => "");
+        throw Object.assign(new Error(`github tree create failed: ${treeRes.status} ${body.slice(0, 300)}`), { status: treeRes.status });
+      }
+      const { sha: newTreeSha } = await treeRes.json();
+
+      const commitRes = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/git/commits`, {
+        method: "POST",
+        headers: { ...githubHeaders(token), "Content-Type": "application/json" },
+        body: JSON.stringify({ message, tree: newTreeSha, parents: [parentSha] }),
+      });
+      if (!commitRes.ok) {
+        const body = await commitRes.text().catch(() => "");
+        throw Object.assign(new Error(`github commit create failed: ${commitRes.status} ${body.slice(0, 300)}`), { status: commitRes.status });
+      }
+      const { sha: newCommitSha } = await commitRes.json();
+
+      const updateRefRes = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/git/refs/heads/${branch}`, {
+        method: "PATCH",
+        headers: { ...githubHeaders(token), "Content-Type": "application/json" },
+        body: JSON.stringify({ sha: newCommitSha }),
+      });
+      if (!updateRefRes.ok) {
+        const body = await updateRefRes.text().catch(() => "");
+        // Non-fast-forward (422) is this endpoint's version of the same "someone else
+        // committed first" race a Contents-API PUT reports as 409 - treated identically below.
+        throw Object.assign(new Error(`github ref update failed: ${updateRefRes.status} ${body.slice(0, 300)}`), { status: updateRefRes.status });
+      }
+
+      return { commit_sha: newCommitSha };
+    } catch (err) {
+      lastError = err;
+      const isConflict = err.status === 409 || err.status === 422;
+      if (!isConflict || attempt === BATCH_COMMIT_RETRY_DELAYS_MS.length) throw lastError;
+      await sleep(withJitter(BATCH_COMMIT_RETRY_DELAYS_MS[attempt]));
+    }
+  }
+  throw lastError;
+}
+
+function cdnUrlFor(config, commitSha, path) {
+  return `https://cdn.jsdelivr.net/gh/${config.owner}/${config.repo}@${commitSha}/${path}`;
+}
+
 /**
  * Encrypt `buffer` with `folder`'s key and commit it to the configured
- * GitHub repo via the Contents API (a plain HTTPS PUT - no local git
- * binary needed).
+ * GitHub repo.
  *
  * The stored filename is a random UUID, deliberately unrelated to the
  * real filename or the file's content - the repo has to be public for
@@ -185,23 +312,24 @@ async function putEncryptedNow({ encrypted, path, message, config, sha }) {
  * real filename never appears anywhere unencrypted - not in the path,
  * not in the commit message - only inside the encrypted manifest entry.
  *
- * Files at or under CHUNK_SIZE upload as a single blob and return
- * { chunked: false, path, commit_sha, cdn_url } (unchanged shape from
- * before chunking existed). Bigger files split into independently
- * AES-GCM-encrypted chunks (own random IV each - never encrypt-then-
- * slice) at `blobs/<folder>/<id>/<index>.enc`, uploaded with limited
- * concurrency, and return { chunked: true, chunkCount, chunks: [{path,
- * commit_sha, cdn_url}, ...] } in chunk-index order. Chunk paths are
- * deterministic per `id`, so re-running uploadFile with the same `id`
- * skips chunks that already exist (resume) instead of re-uploading them.
+ * Files at or under CHUNK_SIZE upload as a single blob via the Contents
+ * API (one HTTP call already does blob+tree+commit+ref together - there's
+ * no batching win to be had for just one blob) and return { chunked:
+ * false, path, commit_sha, cdn_url }. Bigger files split into
+ * independently AES-GCM-encrypted chunks (own random IV each - never
+ * encrypt-then-slice): each chunk's blob is created concurrently (no
+ * commit contention at that stage), then all of them land together in
+ * ONE commit via the Git Data API - a 400MB file at CHUNK_SIZE is ~20+
+ * chunks but only 1 commit, not 20. Returns { chunked: true, chunkCount,
+ * chunks: [{path, commit_sha, cdn_url}, ...] } in chunk-index order.
  *
  * `chunkSize` defaults to CHUNK_SIZE - overridable so tests can exercise
- * chunking without moving 64MB of bytes around.
+ * chunking without moving megabytes of bytes around.
  *
  * `onChunkProgress(completedCount, totalCount)`, if given, fires after
- * each chunk finishes (upload or resume-skip) - the only way to see
- * progress on a single big chunked file, since chunks upload with
- * limited concurrency and the whole call otherwise only resolves once.
+ * each chunk's blob is created - the only way to see progress on a
+ * single big chunked file, since the commit itself only happens once at
+ * the very end.
  */
 export async function uploadFile({ buffer, folder, config, id = randomUUID(), chunkSize = CHUNK_SIZE, onChunkProgress }) {
   if (!folder) throw new Error("folder is required");
@@ -222,27 +350,67 @@ export async function uploadFile({ buffer, folder, config, id = randomUUID(), ch
   }
 
   const chunks = splitIntoChunks(buffer, chunkSize);
-  let headCommitSha; // lazily fetched, at most once, only if resume finds an already-uploaded chunk
   let completed = 0;
-  const results = await runWithConcurrency(chunks, CHUNK_UPLOAD_CONCURRENCY, async (chunk, index) => {
-    const path = `blobs/${folder}/${id}/${index}.enc`;
-    const existingSha = await getExistingSha({ path, config });
-    if (existingSha) {
-      headCommitSha ??= await getHeadCommitSha(config);
-      onChunkProgress?.(++completed, chunks.length);
-      return {
-        path,
-        commit_sha: headCommitSha,
-        cdn_url: `https://cdn.jsdelivr.net/gh/${config.owner}/${config.repo}@${headCommitSha}/${path}`,
-      };
-    }
+  const paths = chunks.map((_, index) => `blobs/${folder}/${id}/${index}.enc`);
+  const blobShas = await runWithConcurrency(chunks, CHUNK_UPLOAD_CONCURRENCY, async (chunk) => {
     const encrypted = encryptBuffer(chunk, key);
-    const result = await putEncrypted({ encrypted, path, message: `store: blob chunk ${index}/${chunks.length}`, config });
+    const sha = await createBlob({ encrypted, config });
     onChunkProgress?.(++completed, chunks.length);
-    return result;
+    return sha;
   });
 
-  return { chunked: true, id, chunkCount: chunks.length, chunks: results };
+  const entries = paths.map((path, index) => ({ path, blobSha: blobShas[index] }));
+  const { commit_sha } = await commitBatch({
+    buildEntries: () => entries, // fixed - chunk blobs don't depend on any other state, safe to reuse across retries
+    message: `store: blob (${chunks.length} chunks)`,
+    config,
+  });
+
+  return {
+    chunked: true, id, chunkCount: chunks.length,
+    chunks: paths.map((path) => ({ path, commit_sha, cdn_url: cdnUrlFor(config, commit_sha, path) })),
+  };
+}
+
+/**
+ * Batches many already-uploaded-elsewhere files' worth of blobs into ONE
+ * commit that ALSO updates the manifest - src/cli.js's upload-folder is
+ * the intended caller: it creates every file's blob(s) concurrently
+ * (createBlobsForFile below), then hands the resulting {path, blobSha}
+ * entries here in batches so N files cost 1 commit instead of N.
+ *
+ * The manifest is re-read fresh inside the retry loop (via buildEntries)
+ * so a concurrent external write to it (another process, a browser
+ * session) doesn't get silently clobbered even under a genuine conflict.
+ */
+export async function commitFilesToManifest({ folder, blobEntries, newManifestEntries, message, config }) {
+  const { commit_sha } = await commitBatch({
+    message,
+    config,
+    buildEntries: async () => {
+      const { entries } = await loadManifest({ folder, config });
+      const mergedEntries = [...entries, ...newManifestEntries];
+      const manifestBytes = Buffer.from(JSON.stringify(mergedEntries), "utf8");
+      const manifestEncrypted = encryptBuffer(manifestBytes, keyForFolder(config, folder));
+      const manifestBlobSha = await createBlob({ encrypted: manifestEncrypted, config });
+      return [...blobEntries, { path: `blobs/${folder}/manifest.enc`, blobSha: manifestBlobSha }];
+    },
+  });
+  return { commit_sha };
+}
+
+/** Creates every blob a single file needs (one if small, one per chunk if not) without committing anything - the caller batches these across files via commitFilesToManifest. Mirrors uploadFile()'s chunking decision exactly. */
+export async function createBlobsForFile({ buffer, folder, config, id = randomUUID(), chunkSize = CHUNK_SIZE }) {
+  const key = keyForFolder(config, folder);
+  if (buffer.length <= chunkSize) {
+    const encrypted = encryptBuffer(buffer, key);
+    const sha = await createBlob({ encrypted, config });
+    return { id, chunked: false, blobEntries: [{ path: `blobs/${folder}/${id}.enc`, blobSha: sha }] };
+  }
+  const chunks = splitIntoChunks(buffer, chunkSize);
+  const blobShas = await runWithConcurrency(chunks, CHUNK_UPLOAD_CONCURRENCY, (chunk) => createBlob({ encrypted: encryptBuffer(chunk, key), config }));
+  const blobEntries = blobShas.map((sha, index) => ({ path: `blobs/${folder}/${id}/${index}.enc`, blobSha: sha }));
+  return { id, chunked: true, chunkCount: chunks.length, blobEntries };
 }
 
 /**

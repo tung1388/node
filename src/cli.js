@@ -25,7 +25,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
-import { uploadFile, downloadFile, storePat, loadManifest, saveManifest, runWithConcurrency } from "./githubStore.js";
+import { uploadFile, downloadFile, storePat, loadManifest, createBlobsForFile, commitFilesToManifest, runWithConcurrency } from "./githubStore.js";
 import { CHUNK_SIZE } from "./crypto.js";
 
 const FILE_UPLOAD_CONCURRENCY = 20;
@@ -160,43 +160,38 @@ async function main() {
     const totalBytes = sizes.reduce((a, b) => a + b, 0);
     console.log(`Found ${files.length} files under ${localDir} (${formatBytes(totalBytes)} total), uploading ${FILE_UPLOAD_CONCURRENCY} at a time`);
 
-    let { entries, sha } = await loadManifest({ folder, config });
-    const existingNames = new Set(entries.map((e) => e.name));
+    const { entries: existingEntries } = await loadManifest({ folder, config });
+    const existingNames = new Set(existingEntries.map((e) => e.name));
     let uploadedBytes = sizes.reduce((sum, size, i) => sum + (existingNames.has(names[i]) ? size : 0), 0);
+    let committedCount = 0;
 
-    // File uploads (encrypt + PUT chunks) run concurrently, but manifest
-    // writes have to be batched and serialized: they all share one `sha`
-    // for GitHub's optimistic-concurrency check, and GitHub's Contents API
-    // can still 409 on the very next write to a path that was just written
-    // a moment ago (its read path can lag its own write path) even when
-    // our own requests are strictly sequential. Writing after every single
-    // file under concurrency hits that constantly, so instead: finished
-    // uploads accumulate in `pending` and get flushed as one manifest
-    // write every MANIFEST_BATCH_SIZE files (plus a final flush at the
-    // end) - far fewer manifest writes, each with more breathing room.
-    const MANIFEST_BATCH_SIZE = 20;
+    // Blob creation (the expensive, large-payload part) runs at full
+    // FILE_UPLOAD_CONCURRENCY with zero commit contention - it doesn't
+    // touch the ref at all. Finished files accumulate in `pending` and
+    // get committed together every COMMIT_BATCH_SIZE files (plus a final
+    // flush at the end): one commit for many files instead of one per
+    // file, which is what actually made this slow before - not the
+    // per-file work itself. commitFilesToManifest (githubStore.js)
+    // handles the serialization/retry/manifest-merge for each batch.
+    const COMMIT_BATCH_SIZE = 20;
     let pending = [];
-    let manifestQueue = Promise.resolve();
+    let commitQueue = Promise.resolve();
     function flush() {
-      if (pending.length === 0) return manifestQueue;
+      if (pending.length === 0) return commitQueue;
       const batch = pending;
       pending = [];
-      manifestQueue = manifestQueue.then(async () => {
-        entries = [...entries, ...batch];
-        for (let attempt = 0; ; attempt += 1) {
-          try {
-            ({ sha } = await saveManifest({ folder, entries, sha, config }));
-            return;
-          } catch (err) {
-            if (attempt >= 5 || !/^github upload failed: 409/.test(err.message)) throw err;
-            await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
-            const fresh = await loadManifest({ folder, config });
-            entries = [...fresh.entries, ...batch];
-            sha = fresh.sha;
-          }
-        }
+      commitQueue = commitQueue.then(async () => {
+        await commitFilesToManifest({
+          folder,
+          blobEntries: batch.flatMap((b) => b.blobEntries),
+          newManifestEntries: batch.map((b) => b.manifestEntry),
+          message: `store: ${batch.length} file(s)`,
+          config,
+        });
+        committedCount += batch.length;
+        console.log(`  committed batch of ${batch.length} file(s) (${committedCount}/${targets.length} total)`);
       });
-      return manifestQueue;
+      return commitQueue;
     }
 
     const targets = files
@@ -213,24 +208,24 @@ async function main() {
       const chunkNote = buffer.length > CHUNK_SIZE ? `, ${Math.ceil(buffer.length / CHUNK_SIZE)} chunks` : "";
       console.log(`[${index + 1}/${files.length}] uploading ${name} (${formatBytes(size)}${chunkNote})`);
 
-      const result = await uploadFile({
-        buffer, folder, config,
-        onChunkProgress: (done, total) => console.log(`  [${name}] chunk ${done}/${total}`),
-      });
+      const result = await createBlobsForFile({ buffer, folder, config });
 
       uploadedBytes += size;
       const overallPct = totalBytes ? ((uploadedBytes / totalBytes) * 100).toFixed(1) : "100.0";
-      console.log(`[${index + 1}/${files.length}] done: ${name} - overall ${formatBytes(uploadedBytes)}/${formatBytes(totalBytes)} (${overallPct}%)`);
+      console.log(`[${index + 1}/${files.length}] prepared: ${name} - overall ${formatBytes(uploadedBytes)}/${formatBytes(totalBytes)} (${overallPct}%)`);
 
       pending.push({
-        id: result.id, name, type, size: buffer.length, uploadedAt: new Date().toISOString(),
-        ...(result.chunked ? { chunked: true, chunkCount: result.chunkCount } : {}),
+        manifestEntry: {
+          id: result.id, name, type, size: buffer.length, uploadedAt: new Date().toISOString(),
+          ...(result.chunked ? { chunked: true, chunkCount: result.chunkCount } : {}),
+        },
+        blobEntries: result.blobEntries,
       });
-      if (pending.length >= MANIFEST_BATCH_SIZE) await flush();
+      if (pending.length >= COMMIT_BATCH_SIZE) await flush();
     });
 
     await flush();
-    console.log(`Done. Manifest has ${entries.length} entries.`);
+    console.log(`Done. Committed ${committedCount} file(s).`);
     return;
   }
 
