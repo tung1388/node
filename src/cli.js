@@ -26,7 +26,6 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import { uploadFile, downloadFile, storePat, loadManifest, createBlobsForFile, commitFilesToManifest, runWithConcurrency } from "./githubStore.js";
-import { CHUNK_SIZE } from "./crypto.js";
 
 // Commit batching (COMMIT_BATCH_SIZE below) is what actually cuts request
 // count - this just keeps blob-creation (the bulk of the work, but no
@@ -167,7 +166,7 @@ async function main() {
 
     const { entries: existingEntries } = await loadManifest({ folder, config });
     const existingNames = new Set(existingEntries.map((e) => e.name));
-    let uploadedBytes = sizes.reduce((sum, size, i) => sum + (existingNames.has(names[i]) ? size : 0), 0);
+    let committedBytes = sizes.reduce((sum, size, i) => sum + (existingNames.has(names[i]) ? size : 0), 0);
     let committedCount = 0;
 
     // Blob creation (the expensive, large-payload part) runs at full
@@ -203,7 +202,9 @@ async function main() {
           config,
         });
         committedCount += batch.length;
-        console.log(`  committed batch of ${batch.length} file(s) (${committedCount}/${targets.length} total)`);
+        committedBytes += batch.reduce((sum, b) => sum + b.manifestEntry.size, 0);
+        const pct = totalBytes ? ((committedBytes / totalBytes) * 100).toFixed(1) : "100.0";
+        console.log(`Committed ${committedCount}/${targets.length} files - ${formatBytes(committedBytes)}/${formatBytes(totalBytes)} (${pct}%)`);
       });
       return commitQueue;
     }
@@ -216,17 +217,16 @@ async function main() {
         return false;
       });
 
-    await runWithConcurrency(targets, FILE_UPLOAD_CONCURRENCY, async ({ filePath, name, size, index }) => {
+    // Deliberately no per-file "uploading .../prepared ..." console lines here -
+    // with FILE_UPLOAD_CONCURRENCY files prepping at once, that output interleaves
+    // out of order and doesn't reflect what's actually persisted yet anyway (a
+    // "prepared" file is just a blob sitting unreferenced until its batch commits).
+    // The only progress that means anything is printed by flush() above, once a
+    // batch is actually committed.
+    await runWithConcurrency(targets, FILE_UPLOAD_CONCURRENCY, async ({ filePath, name }) => {
       const buffer = await fs.readFile(filePath);
       const type = guessType(filePath);
-      const chunkNote = buffer.length > CHUNK_SIZE ? `, ${Math.ceil(buffer.length / CHUNK_SIZE)} chunks` : "";
-      console.log(`[${index + 1}/${files.length}] uploading ${name} (${formatBytes(size)}${chunkNote})`);
-
       const result = await createBlobsForFile({ buffer, folder, config });
-
-      uploadedBytes += size;
-      const overallPct = totalBytes ? ((uploadedBytes / totalBytes) * 100).toFixed(1) : "100.0";
-      console.log(`[${index + 1}/${files.length}] prepared: ${name} - overall ${formatBytes(uploadedBytes)}/${formatBytes(totalBytes)} (${overallPct}%)`);
 
       pending.push({
         manifestEntry: {
