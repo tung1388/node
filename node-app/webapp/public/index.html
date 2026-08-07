@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Image Sorter</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="toolbar1" class="toolbar">
+    <button id="btn-input-root">Input Root...</button>
+    <button id="btn-output-root">Output Root...</button>
+    <button id="btn-hls-to-mp4">Convert HLS to MP4...</button>
+    <button id="btn-prompt-file">Prompt File...</button>
+    <button id="btn-reload">Reload</button>
+    <button id="btn-find-outputs" class="primary" title="Pick Input folder(s)/image(s) (or select 'All folders' for the whole root) + one or more prompts, then click this or press Enter to see the matching Output images">Find Outputs... (Enter)</button>
+    <button id="btn-find-orphans" title="Pick Input folder(s) (or select 'All folders'), then click this to list Output images that don't match any current prompt or input image">Find Orphaned Outputs...</button>
+    <span class="spacer"></span>
+    <button id="btn-encrypt" class="danger-adjacent">Encrypt Folder...</button>
+    <button id="btn-decrypt" class="danger-adjacent">Decrypt Folder...</button>
+  </div>
+
+  <div id="toolbar2" class="toolbar">
+    <input id="search-box" type="text" placeholder="Search filename..." />
+    <select id="sort-select">
+      <option value="name">Sort: Name</option>
+      <option value="folder">Sort: Folder</option>
+      <option value="prompt">Sort: Prompt</option>
+    </select>
+  </div>
+
+  <div id="body">
+    <div id="left-panel">
+      <div class="section" id="input-section">
+        <div class="section-header" id="input-section-header">
+          <span class="section-arrow" id="input-section-arrow">&#9662;</span>
+          <span>Input</span>
+        </div>
+        <div id="input-folder-list" class="list-box" aria-label="Input folders"></div>
+      </div>
+      <div class="section" id="videos-section">
+        <div class="section-header" id="videos-section-header">
+          <span class="section-arrow" id="videos-section-arrow">&#9662;</span>
+          <span>Videos</span>
+        </div>
+        <div id="videos-list" class="list-box" aria-label="Videos"></div>
+      </div>
+      <div class="section" id="archive-section">
+        <div class="section-header" id="archive-section-header">
+          <span class="section-arrow" id="archive-section-arrow">&#9662;</span>
+          <span>Archive</span>
+        </div>
+        <div id="archive-list" class="list-box" aria-label="Archive"></div>
+      </div>
+    </div>
+    <div id="grid-wrap">
+      <div id="grid"></div>
+    </div>
+    <div id="right-resizer" title="Drag to resize"></div>
+    <div id="right-panel">
+      <div class="section" id="prompt-section">
+        <div class="section-header">
+          <span>Prompts</span>
+          <span class="section-hint">(used by Find Outputs)</span>
+          <span class="spacer"></span>
+          <button id="btn-prompts-all" class="mini-btn">All</button>
+          <button id="btn-prompts-none" class="mini-btn">None</button>
+        </div>
+        <div id="prompt-list" class="list-box" aria-label="Prompts"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="status">Pick an input root, output root, and prompt file to begin.</div>
+
+  <div id="viewer-overlay" class="hidden">
+    <div id="viewer-topbar">
+      <div id="viewer-title"></div>
+      <div id="viewer-zoom-controls">
+        <button id="viewer-zoom-out" title="Zoom out (-)">&#8722;</button>
+        <button id="viewer-zoom-reset" title="Reset zoom (0)">100%</button>
+        <button id="viewer-zoom-in" title="Zoom in (+)">&#43;</button>
+        <button id="viewer-close" title="Close (Esc)">&#10005;</button>
+      </div>
+    </div>
+    <div id="viewer-image-wrap">
+      <img id="viewer-image" alt="" draggable="false" />
+      <video id="viewer-video" class="hidden" controls playsinline></video>
+      <audio id="viewer-audio" class="hidden" controls></audio>
+      <pre id="viewer-text" class="hidden"></pre>
+      <div id="viewer-arrow-left" class="viewer-arrow" title="Previous (Left arrow)">&#8249;</div>
+      <div id="viewer-arrow-right" class="viewer-arrow" title="Next (Right arrow)">&#8250;</div>
+    </div>
+    <div id="viewer-filmstrip"></div>
+  </div>
+
+  <div id="modal-overlay" class="modal-overlay hidden">
+    <div id="modal" class="modal-box">
+      <h2 id="modal-title">Encrypt Folder</h2>
+      <div class="modal-row">
+        <label>Source folder</label>
+        <input id="modal-source" type="text" readonly />
+        <button id="modal-pick-source">Browse...</button>
+      </div>
+      <div class="modal-row">
+        <label>Destination folder</label>
+        <input id="modal-dest" type="text" readonly />
+        <button id="modal-pick-dest">Browse...</button>
+      </div>
+      <div class="modal-row" id="modal-password-row">
+        <label>Password</label>
+        <input id="modal-password" type="password" />
+      </div>
+      <div class="modal-row" id="modal-confirm-row">
+        <label>Confirm password</label>
+        <input id="modal-confirm" type="password" />
+      </div>
+      <div class="modal-row">
+        <label class="checkbox-label"><input id="modal-force" type="checkbox" /> Write into non-empty destination</label>
+      </div>
+      <div class="modal-actions">
+        <button id="modal-start">Start</button>
+        <button id="modal-cancel">Close</button>
+      </div>
+      <pre id="modal-log" class="modal-log"></pre>
+    </div>
+  </div>
+
+  <div id="hls-modal-overlay" class="modal-overlay hidden">
+    <div class="modal-box">
+      <h2>Convert HLS to MP4</h2>
+      <div class="modal-row">
+        <label>Playlist</label>
+        <button type="button" id="hls-mode-file" class="mini-btn">File</button>
+        <button type="button" id="hls-mode-paste" class="mini-btn">Paste</button>
+      </div>
+      <div class="modal-row" id="hls-file-row">
+        <label>.m3u8 file</label>
+        <input id="hls-input-path" type="text" readonly />
+        <button id="hls-pick-input">Browse...</button>
+      </div>
+      <div class="modal-row-stack hidden" id="hls-paste-row">
+        <label>.m3u8 content</label>
+        <textarea id="hls-input-paste" rows="6" placeholder="Paste the .m3u8 playlist content here..."></textarea>
+      </div>
+      <div class="modal-row">
+        <label>Destination folder</label>
+        <input id="hls-dest-dir" type="text" readonly />
+        <button id="hls-pick-dest">Browse...</button>
+      </div>
+      <div class="modal-row">
+        <label>Output filename</label>
+        <input id="hls-output-name" type="text" placeholder="output.mp4" />
+      </div>
+      <div class="modal-row">
+        <label>Parallel downloads</label>
+        <input id="hls-parallel" type="number" min="1" max="64" value="10" />
+      </div>
+      <div class="modal-actions">
+        <button id="hls-start">Start</button>
+        <button id="hls-cancel">Close</button>
+      </div>
+      <pre id="hls-log" class="modal-log"></pre>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

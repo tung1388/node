@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>githost</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main>
+    <h1>githost</h1>
+    <p class="subtitle">Encrypted file storage on GitHub, served via jsDelivr. Nothing here ever leaves your browser unencrypted.</p>
+
+    <form id="login-form" class="card">
+      <h2>Log in</h2>
+      <label>
+        Password
+        <input id="login-password" type="password" autocomplete="current-password" />
+      </label>
+      <p id="login-status" class="hint"></p>
+      <p id="login-error" class="error"></p>
+      <button type="submit">Log in</button>
+      <p class="hint">No access token needed - your password unlocks a stored, encrypted one. Everything above is saved only in this browser's local storage.</p>
+    </form>
+
+    <section id="app" class="card hidden">
+      <div class="app-header">
+        <span id="whoami"></span>
+        <button id="logout-btn" class="secondary">Disconnect</button>
+      </div>
+
+      <div class="upload-row">
+        <label class="upload-btn">
+          Upload a file
+          <input id="file-input" type="file" class="hidden" />
+        </label>
+        <span id="upload-status"></span>
+      </div>
+
+      <div id="root-tabs" class="root-tabs hidden"></div>
+      <div id="prompts-panel" class="prompts-panel hidden"></div>
+
+      <div class="list-header">
+        <h2>Your files</h2>
+        <button id="refresh-btn" class="secondary">Refresh</button>
+      </div>
+      <ul id="file-list"></ul>
+    </section>
+  </main>
+
+  <div id="preview-modal" class="preview-modal hidden">
+    <div class="preview-panel">
+      <div class="preview-header">
+        <span id="preview-title"></span>
+        <button id="preview-close" class="secondary">Close</button>
+      </div>
+      <div id="preview-body" class="preview-body"></div>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

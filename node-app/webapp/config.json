@@ -1,0 +1,5 @@
+{
+  "inputRoot": "..\\input",
+  "outputRoot": "..\\compressed",
+  "promptFile": "..\\full_prompts.txt"
+}

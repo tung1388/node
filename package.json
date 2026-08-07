@@ -1,0 +1,15 @@
+{
+  "name": "githost",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Prototype: encrypted static-file storage via GitHub + jsDelivr",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.js\"",
+    "upload": "node src/cli.js upload",
+    "download": "node src/cli.js download"
+  }
+}
