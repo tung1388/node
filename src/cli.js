@@ -28,7 +28,12 @@ import { fileURLToPath } from "url";
 import { uploadFile, downloadFile, storePat, loadManifest, createBlobsForFile, commitFilesToManifest, runWithConcurrency } from "./githubStore.js";
 import { CHUNK_SIZE } from "./crypto.js";
 
-const FILE_UPLOAD_CONCURRENCY = 20;
+// Commit batching (COMMIT_BATCH_SIZE below) is what actually cuts request
+// count - this just keeps blob-creation (the bulk of the work, but no
+// longer commit-contended) reasonably parallel. 100 was tripping GitHub's
+// secondary rate limit (abuse detection for request bursts); keeping this
+// in the low tens avoids that without giving up meaningful throughput.
+const FILE_UPLOAD_CONCURRENCY = 12;
 
 const MIME_BY_EXT = {
   ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif",
@@ -173,7 +178,16 @@ async function main() {
     // file, which is what actually made this slow before - not the
     // per-file work itself. commitFilesToManifest (githubStore.js)
     // handles the serialization/retry/manifest-merge for each batch.
-    const COMMIT_BATCH_SIZE = 20;
+    //
+    // The tree/commit payload for a batch is just small {path, blob_sha}
+    // entries - negligible size even at hundreds of them - so there's no
+    // real ceiling here. The tradeoff is entirely about risk window: a
+    // bigger batch means more already-blobbed files sit uncommitted (and
+    // so invisible to the manifest / resume-skip check) if the process
+    // dies mid-batch - not lost work (blob creation is idempotent, a
+    // re-run just re-creates the same content-addressed blobs), just a
+    // slightly larger chunk to redo.
+    const COMMIT_BATCH_SIZE = 50;
     let pending = [];
     let commitQueue = Promise.resolve();
     function flush() {
