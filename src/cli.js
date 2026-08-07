@@ -28,7 +28,7 @@ import { fileURLToPath } from "url";
 import { uploadFile, downloadFile, storePat, loadManifest, saveManifest, runWithConcurrency } from "./githubStore.js";
 import { CHUNK_SIZE } from "./crypto.js";
 
-const FILE_UPLOAD_CONCURRENCY = 5;
+const FILE_UPLOAD_CONCURRENCY = 20;
 
 const MIME_BY_EXT = {
   ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif",

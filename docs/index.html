@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <main>
+  <main id="login-screen">
     <h1>githost</h1>
     <p class="subtitle">Encrypted file storage on GitHub, served via jsDelivr. Nothing here ever leaves your browser unencrypted.</p>
 
@@ -22,31 +22,106 @@
       <button type="submit">Log in</button>
       <p class="hint">No access token needed - your password unlocks a stored, encrypted one. Everything above is saved only in this browser's local storage.</p>
     </form>
-
-    <section id="app" class="card hidden">
-      <div class="app-header">
-        <span id="whoami"></span>
-        <button id="logout-btn" class="secondary">Disconnect</button>
-      </div>
-
-      <div class="upload-row">
-        <label class="upload-btn">
-          Upload a file
-          <input id="file-input" type="file" class="hidden" />
-        </label>
-        <span id="upload-status"></span>
-      </div>
-
-      <div id="root-tabs" class="root-tabs hidden"></div>
-      <div id="prompts-panel" class="prompts-panel hidden"></div>
-
-      <div class="list-header">
-        <h2>Your files</h2>
-        <button id="refresh-btn" class="secondary">Refresh</button>
-      </div>
-      <ul id="file-list"></ul>
-    </section>
   </main>
+
+  <div id="app" class="hidden">
+    <div id="toolbar1" class="toolbar">
+      <button id="btn-reload">Reload</button>
+      <button id="btn-find-outputs" class="primary" title="Pick Input folder(s)/image(s) (or 'All folders') + one or more prompts, then click this or press Enter to see the matching Output images">Find Outputs... (Enter)</button>
+      <button id="btn-find-orphans" title="Pick Input folder(s) (or 'All folders'), then click this to list Output images that don't match any current prompt or input image">Find Orphaned Outputs...</button>
+      <span class="spacer"></span>
+      <label class="mini-btn" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+        Upload
+        <input id="file-input" type="file" class="hidden" />
+      </label>
+      <span id="upload-status"></span>
+      <button id="logout-btn" class="secondary">Disconnect</button>
+    </div>
+
+    <div id="toolbar2" class="toolbar">
+      <input id="search-box" type="text" placeholder="Search filename..." />
+      <select id="sort-select">
+        <option value="name">Sort: Name</option>
+        <option value="folder">Sort: Folder</option>
+        <option value="prompt">Sort: Prompt</option>
+      </select>
+    </div>
+
+    <div id="body">
+      <div id="left-panel">
+        <div class="section" id="input-section">
+          <div class="section-header" id="input-section-header">
+            <span class="section-arrow" id="input-section-arrow">&#9662;</span>
+            <span>Input</span>
+          </div>
+          <div id="input-folder-list" class="list-box" aria-label="Input folders"></div>
+        </div>
+        <div class="section" id="videos-section">
+          <div class="section-header" id="videos-section-header">
+            <span class="section-arrow" id="videos-section-arrow">&#9662;</span>
+            <span>Videos</span>
+          </div>
+          <div id="videos-list" class="list-box" aria-label="Videos"></div>
+        </div>
+        <div class="section" id="archive-section">
+          <div class="section-header" id="archive-section-header">
+            <span class="section-arrow" id="archive-section-arrow">&#9662;</span>
+            <span>Archive</span>
+          </div>
+          <div id="archive-list" class="list-box" aria-label="Archive"></div>
+        </div>
+      </div>
+      <div id="grid-wrap">
+        <div id="grid"></div>
+      </div>
+      <div id="right-resizer" title="Drag to resize"></div>
+      <div id="right-panel">
+        <div class="section" id="prompt-section">
+          <div class="section-header">
+            <span>Prompts</span>
+            <span class="section-hint">(used by Find Outputs)</span>
+            <span class="spacer"></span>
+            <button id="btn-prompts-all" class="mini-btn">All</button>
+            <button id="btn-prompts-none" class="mini-btn">None</button>
+          </div>
+          <div id="prompt-list" class="list-box" aria-label="Prompts"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="other-files-section">
+      <div id="other-files-header">
+        <span class="section-arrow" id="other-files-arrow">&#9662;</span>
+        <span>Other files (anything not under input/output/videos/archive)</span>
+      </div>
+      <div id="other-files-body">
+        <ul id="file-list"></ul>
+      </div>
+    </div>
+
+    <div id="status">Ready.</div>
+  </div>
+
+  <div id="viewer-overlay" class="viewer-overlay hidden">
+    <div id="viewer-topbar">
+      <div id="viewer-title"></div>
+      <div id="viewer-zoom-controls">
+        <button id="viewer-zoom-out" title="Zoom out (-)">&#8722;</button>
+        <button id="viewer-zoom-reset" title="Reset zoom (0)">100%</button>
+        <button id="viewer-zoom-in" title="Zoom in (+)">&#43;</button>
+        <button id="viewer-close" title="Close (Esc)">&#10005;</button>
+      </div>
+    </div>
+    <div id="viewer-image-wrap">
+      <img id="viewer-image" alt="" draggable="false" />
+      <video id="viewer-video" class="hidden" controls playsinline></video>
+      <audio id="viewer-audio" class="hidden" controls></audio>
+      <pre id="viewer-text" class="hidden"></pre>
+      <div id="viewer-arrow-left" class="viewer-arrow" title="Previous (Left arrow)">&#8249;</div>
+      <div id="viewer-arrow-right" class="viewer-arrow" title="Next (Right arrow)">&#8250;</div>
+    </div>
+    <div id="viewer-filmstrip"></div>
+  </div>
 
   <div id="preview-modal" class="preview-modal hidden">
     <div class="preview-panel">
