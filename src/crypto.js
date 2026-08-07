@@ -52,12 +52,15 @@ export function decryptBuffer(buffer, key) {
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
 
-// Fixed-size chunking for large files (see system.md §3): git hard-blocks
-// blobs over ~100MB and the Contents API base64-inflates the body on top
-// of that, so anything past this threshold gets split into independently
-// encrypted pieces (own random IV each - never encrypt-then-slice) rather
-// than committed as one blob.
-export const CHUNK_SIZE = 64 * 1024 * 1024; // 64MB - see system.md's request-count table
+// Fixed-size chunking for large files (see system.md §3). Two independent
+// ceilings, not one: the Contents API's write side chokes on the base64-
+// inflated request body well before git's own ~100MB blob cap (tested
+// reliably up to 30MB); separately, and more strictly, jsDelivr's own
+// GitHub CDN mode - what CLI downloads actually read through - hard-caps
+// served files at 20MB ("File size exceeded the configured limit of
+// 20 MB", confirmed by hitting it with a 20*1024*1024-byte chunk). 18MB
+// clears both with margin.
+export const CHUNK_SIZE = 18 * 1024 * 1024; // 18MB
 
 export function splitIntoChunks(buffer, chunkSize = CHUNK_SIZE) {
   const chunks = [];

@@ -75,13 +75,13 @@ export function unpackEnvelope(bytes) {
 
 // ---------------------------------------------------------------------
 // Fixed-size chunking for large files (see system.md §3 / src/crypto.js's
-// Node-side twin). Files over CHUNK_SIZE are split into independently
-// AES-GCM-encrypted pieces instead of one blob - git hard-blocks blobs
-// over ~100MB and the Contents API base64-inflates the body on top of
-// that.
+// Node-side twin for the full reasoning: the Contents API's write side
+// and jsDelivr's read side each impose their own ceiling, and jsDelivr's
+// 20MB cap is the stricter of the two - kept identical here so either
+// side can read a chunk the other side wrote).
 // ---------------------------------------------------------------------
 
-export const CHUNK_SIZE = 64 * 1024 * 1024; // 64MB - matches src/crypto.js
+export const CHUNK_SIZE = 18 * 1024 * 1024; // 18MB - matches src/crypto.js
 
 export function splitIntoChunks(bytes, chunkSize = CHUNK_SIZE) {
   const chunks = [];

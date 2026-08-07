@@ -101,27 +101,39 @@ async function getHeadCommitSha(config) {
 
 const COMMIT_CONFLICT_RETRY_DELAYS_MS = [300, 600, 1200, 2000, 3000];
 
+// The Contents API's commits are inherently serialized per-repo: each PUT
+// creates a new commit with the branch's current HEAD as its sole parent,
+// then fast-forwards the branch ref - only one commit can land at a time,
+// no matter how many PUTs (even to completely unrelated paths) are in
+// flight at once. Retrying a 409 works for a HANDFUL of concurrent
+// writers, but the odds of winning any given round drop as concurrency
+// rises, and a fixed retry budget eventually runs out - exactly what
+// happened at higher upload-folder concurrency. Rather than fight that
+// with more retries, actual writes are funneled through this one-at-a-
+// time queue; only the prep work before a write (reading a file,
+// encrypting it) benefits from a caller's concurrency setting, which is
+// still a real win - the next write in line can fire the instant the
+// previous one's response lands, with its bytes already ready.
+let writeQueue = Promise.resolve();
+function enqueueWrite(task) {
+  const run = writeQueue.then(task, task);
+  writeQueue = run.catch(() => {}); // keep the queue alive even if this write ultimately fails
+  return run;
+}
+
 /**
  * Shared PUT-encrypted-content-at-a-path core, used by uploadFile (random
  * path, always new) and storePat/saveManifest (fixed path, may already
- * exist).
- *
- * The Contents API commits are inherently serialized per-repo: each PUT
- * creates a new commit with the branch's current HEAD as its sole parent,
- * then fast-forwards the branch ref. Two PUTs in flight at once - even to
- * completely unrelated paths - can both read the same HEAD and race to
- * move the ref; the loser gets a 409, regardless of whether `sha` was
- * involved in the actual conflict. Since a fresh commit at the new HEAD
- * is exactly what a retry produces, just resending the same request a
- * few times (no need to touch `sha` - that part of the request was
- * correct) is enough to win eventually.
- *
- * This does NOT cover the different case of the same path being updated
- * by two independent operations, where `sha` itself genuinely goes stale
- * and the caller needs to re-read the content before retrying - see
- * src/cli.js's upload-folder manifest-flush retry for that.
+ * exist). The actual HTTP call is queued (see enqueueWrite above); the
+ * retry loop here is a safety net for the rarer case of a genuinely
+ * external writer (another process, a browser session) landing a commit
+ * in between, not the primary defense against concurrency.
  */
 async function putEncrypted({ encrypted, path, message, config, sha }) {
+  return enqueueWrite(() => putEncryptedNow({ encrypted, path, message, config, sha }));
+}
+
+async function putEncryptedNow({ encrypted, path, message, config, sha }) {
   const { token, owner, repo } = config;
   let lastError;
   for (let attempt = 0; attempt <= COMMIT_CONFLICT_RETRY_DELAYS_MS.length; attempt += 1) {
